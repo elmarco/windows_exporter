@@ -228,6 +228,20 @@ func unmarshalInstance(instance *Instance, structType reflect.Type, structValue 
 			field.SetFloat(float64(math.Float32frombits(uint32(element.value))))
 		case ValueTypeREAL64:
 			field.SetFloat(math.Float64frombits(uint64(element.value)))
+		case ValueTypeINSTANCE:
+			if element.value == 0 {
+				continue
+			}
+
+			if field.Kind() != reflect.Struct {
+				return fmt.Errorf("field %s is not a struct but MI value is an instance", miTag)
+			}
+
+			nestedInstance := (*Instance)(unsafe.Pointer(element.value))
+
+			if err := unmarshalInstance(nestedInstance, field.Type(), field, skipMissing); err != nil {
+				return fmt.Errorf("failed to unmarshal embedded instance %s: %w", miTag, err)
+			}
 		default:
 			return fmt.Errorf("unsupported value type: %d", element.valueType)
 		}
