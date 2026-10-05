@@ -41,7 +41,7 @@ type Config struct{}
 //nolint:gochecknoglobals
 var ConfigDefaults = Config{}
 
-// A Collector is a Prometheus Collector for WMI metrics.
+// A Collector is a Prometheus Collector for OS metrics.
 type Collector struct {
 	config Config
 
@@ -49,6 +49,7 @@ type Collector struct {
 
 	hostname      *prometheus.Desc
 	osInformation *prometheus.Desc
+	smbiosInfo    *prometheus.Desc
 	installTime   *prometheus.Desc
 }
 
@@ -76,7 +77,7 @@ func (c *Collector) Close() error {
 	return nil
 }
 
-func (c *Collector) Build(_ *slog.Logger, _ *mi.Session) error {
+func (c *Collector) Build(logger *slog.Logger, _ *mi.Session) error {
 	productName, revision, installationType, err := c.getWindowsVersion()
 	if err != nil {
 		return fmt.Errorf("failed to get Windows version: %w", err)
@@ -129,6 +130,8 @@ func (c *Collector) Build(_ *slog.Logger, _ *mi.Session) error {
 		nil,
 	)
 
+	c.buildSMBIOSInfo(logger)
+
 	return nil
 }
 
@@ -149,11 +152,56 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric, _ time.Duration) error 
 		c.installTimeTimestamp,
 	)
 
+	if c.smbiosInfo != nil {
+		ch <- prometheus.MustNewConstMetric(
+			c.smbiosInfo,
+			prometheus.GaugeValue,
+			1.0,
+		)
+	}
+
 	if err := c.collectHostname(ch); err != nil {
 		errs = append(errs, fmt.Errorf("failed to collect hostname metrics: %w", err))
 	}
 
 	return errors.Join(errs...)
+}
+
+func (c *Collector) buildSMBIOSInfo(logger *slog.Logger) {
+	info, err := sysinfoapi.GetSMBIOSSystemInfo()
+	if err != nil {
+		logger.Warn("SMBIOS system info unavailable, skipping smbios_info metric", slog.Any("err", err))
+
+		return
+	}
+
+	// Sanitize label values: firmware strings may contain invalid UTF-8 bytes.
+	cleanLabel := func(s string) string {
+		return strings.ToValidUTF8(strings.TrimSpace(s), "")
+	}
+
+	desc := prometheus.NewDesc(
+		prometheus.BuildFQName(types.Namespace, Name, "smbios_info"),
+		"System product information from SMBIOS. On VMs, reflects hypervisor-assigned identity; on physical hosts, reflects hardware SMBIOS data.",
+		nil,
+		prometheus.Labels{
+			"uuid":               strings.ToLower(cleanLabel(info.UUID)),
+			"vendor":             cleanLabel(info.Manufacturer),
+			"name":               cleanLabel(info.ProductName),
+			"identifying_number": cleanLabel(info.SerialNumber),
+			"version":            cleanLabel(info.Version),
+		},
+	)
+
+	// Validate the descriptor by attempting to create a metric.
+	// If label values are still invalid, log a warning and skip.
+	if _, err = prometheus.NewConstMetric(desc, prometheus.GaugeValue, 1.0); err != nil {
+		logger.Warn("SMBIOS labels produced an invalid metric, skipping smbios_info", slog.Any("err", err))
+
+		return
+	}
+
+	c.smbiosInfo = desc
 }
 
 func (c *Collector) collectHostname(ch chan<- prometheus.Metric) error {
